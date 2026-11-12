@@ -33,6 +33,7 @@ from .highlighter import (
     ParsedEvent,
     Severity,
     StyledSpan,
+    enhance_line,
 )
 from .ports import (
     COMMON_BAUDRATES,
@@ -234,6 +235,7 @@ class ScreenUIWindow(Adw.ApplicationWindow):
         )
         self._tag_cache: dict[tuple[Optional[str], Optional[str], bool, bool, bool, bool], Gtk.TextTag] = {}
         self._search_tag: Optional[Gtk.TextTag] = None
+        self._font_css_provider = Gtk.CssProvider()
 
         self._apply_css()
         self._build_ui()
@@ -254,12 +256,25 @@ class ScreenUIWindow(Adw.ApplicationWindow):
     def _apply_css(self) -> None:
         style_mgr = Adw.StyleManager.get_default()
         style_mgr.set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        display = Gdk.Display.get_default()
         provider = Gtk.CssProvider()
-        provider.load_from_data(APP_CSS.encode("utf-8"))
+        if hasattr(provider, "load_from_string"):
+            provider.load_from_string(APP_CSS)
+            self._font_css_provider.load_from_string(f"textview.terminal-view {{ font-size: {self._font_size}pt; }}")
+        else:
+            provider.load_from_data(APP_CSS.encode("utf-8"))
+            self._font_css_provider.load_from_data(
+                f"textview.terminal-view {{ font-size: {self._font_size}pt; }}".encode("utf-8")
+            )
         Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(),
+            display,
             provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+        Gtk.StyleContext.add_provider_for_display(
+            display,
+            self._font_css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
         )
 
     # ------------------------------------------------------------------ UI Build
@@ -837,7 +852,7 @@ class ScreenUIWindow(Adw.ApplicationWindow):
             self._toast(f"Detected port: {ports[chosen_idx].device}")
 
     def _poll_ports_timer(self) -> bool:
-        if not self._backend.is_connected:
+        if not self._backend.is_connected and not self._detecting_baud:
             new_ports = list_serial_ports(include_legacy_ttys=self._include_legacy_ttys)
             old_devs = [p.device for p in self._ports]
             new_devs = [p.device for p in new_ports]
@@ -1033,6 +1048,8 @@ class ScreenUIWindow(Adw.ApplicationWindow):
                 )
                 self._replace_last_line_in_buffer(self._entries[-1])
                 self._has_incomplete_line = not ev.text.endswith("\n")
+                if ev.text.endswith("\n"):
+                    self._tally_severity(ev.severity)
                 continue
 
             entry = LogEntry(
@@ -1111,13 +1128,17 @@ class ScreenUIWindow(Adw.ApplicationWindow):
             self._buffer.apply_tag(ts_tag, p_start, p_end)
 
         text_base = line_start_offset + len(prefix)
-        for sp in entry.spans:
-            s_off = text_base + max(0, sp.start)
-            e_off = text_base + min(len(entry.text), sp.end)
-            if e_off > s_off:
-                it_s = self._buffer.get_iter_at_offset(s_off)
-                it_e = self._buffer.get_iter_at_offset(e_off)
-                self._buffer.apply_tag(self._get_or_create_tag(sp), it_s, it_e)
+        if self._colorize:
+            spans = entry.spans
+            if not spans and not entry.is_tx:
+                _, spans = enhance_line(entry.text.rstrip("\n"), colorize=True)
+            for sp in spans:
+                s_off = text_base + max(0, sp.start)
+                e_off = text_base + min(len(entry.text), sp.end)
+                if e_off > s_off:
+                    it_s = self._buffer.get_iter_at_offset(s_off)
+                    it_e = self._buffer.get_iter_at_offset(e_off)
+                    self._buffer.apply_tag(self._get_or_create_tag(sp), it_s, it_e)
 
         self._last_incomplete_range = (line_start_offset, line_start_offset + len(full_text))
 
@@ -1253,6 +1274,7 @@ class ScreenUIWindow(Adw.ApplicationWindow):
     def _on_colorize_toggled(self, btn: Gtk.ToggleButton) -> None:
         self._colorize = btn.get_active()
         self._stream.colorize = self._colorize
+        self._rebuild_buffer_from_entries()
         self._toast(f"Embedded color enhancement {'enabled' if self._colorize else 'disabled'}")
 
     def _on_direct_keys_toggled(self, btn: Gtk.ToggleButton) -> None:
@@ -1272,12 +1294,11 @@ class ScreenUIWindow(Adw.ApplicationWindow):
         self._apply_font_size()
 
     def _apply_font_size(self) -> None:
-        provider = Gtk.CssProvider()
         css = f"textview.terminal-view {{ font-size: {self._font_size}pt; }}"
-        provider.load_from_data(css.encode("utf-8"))
-        self._text_view.get_style_context().add_provider(
-            provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1
-        )
+        if hasattr(self._font_css_provider, "load_from_string"):
+            self._font_css_provider.load_from_string(css)
+        else:
+            self._font_css_provider.load_from_data(css.encode("utf-8"))
 
     def _clear_output(self, keep_history: bool = False) -> None:
         self._buffer.set_text("")

@@ -159,6 +159,7 @@ class ScreenBackend:
                 "defscrollback 50000\n"
                 "altscreen off\n"
                 "defutf8 on\n"
+                "maptimeout 50\n"
                 "term xterm-256color\n"
                 "termcapinfo xterm* ti@:te@\n"
             )
@@ -297,7 +298,12 @@ class ScreenBackend:
     def connect_direct_serial(self, port: str, baudrate: int) -> None:
         """Fallback direct pyserial connection without GNU screen."""
         self.disconnect(kill_session=False)
-        ser = serial.Serial(port=port, baudrate=baudrate, timeout=0.05)
+        try:
+            ser = serial.Serial(port=port, baudrate=baudrate, timeout=0.05)
+        except serial.SerialException:
+            # Brief retry in case a just-terminated `screen` server is releasing its lock
+            time.sleep(0.25)
+            ser = serial.Serial(port=port, baudrate=baudrate, timeout=0.05)
         with self._lock:
             self.mode = "serial"
             self.port = port
@@ -365,11 +371,9 @@ class ScreenBackend:
                 data = ser.read(waiting or 1)
                 if data:
                     self._on_data(data)
-            except serial.SerialException as exc:
-                reason = f"Serial error: {exc}"
-                break
-            except OSError as exc:
-                reason = f"I/O error: {exc}"
+            except (serial.SerialException, OSError, TypeError, ValueError) as exc:
+                if self._running:
+                    reason = f"Serial error: {exc}"
                 break
 
         was_running = self._running
@@ -431,7 +435,9 @@ class ScreenBackend:
             return False
         if self.mode == "screen" and self._pty_master is not None:
             try:
-                os.write(self._pty_master, data)
+                # Escape GNU screen's Ctrl+A (0x01) command prefix so raw 0x01 / HEX bytes pass through.
+                payload = data.replace(b"\x01", b"\x01a")
+                os.write(self._pty_master, payload)
                 return True
             except OSError:
                 return False
